@@ -1,0 +1,685 @@
+Ja — deze code klopt met de pin-layout zoals we ’m eerder hebben gezet (zonder servo en zonder hall sensor aangesloten). Hieronder de verwachte bekabeling per onderdeel zodat je 1-op-1 kunt checken:
+
+TFT ILI9341 (SPI)
+
+MOSI → GPIO 23
+
+MISO → GPIO 19
+
+SCLK → GPIO 18
+
+CS → GPIO 25 (let op: in je platformio.ini heb je -DTFT_CS=25, dus draadje echt naar 25)
+
+DC → GPIO 27
+
+RST → GPIO 33
+
+VCC → 5V
+
+GND → GND
+
+(BL/LED → 3V3/5V of via transistor; mag ook los blijven)
+
+BME280 (I²C)
+
+SDA → GPIO 21
+
+SCL → GPIO 22
+
+VIN → 3V3
+
+GND → GND
+
+Regenmodule
+
+AO (analog) → GPIO 34 (komt overeen met #define RAIN_A0 34)
+
+DO (digital) → GPIO 26 (komt overeen met #define RAIN_D0 26 — je code zet INPUT_PULLUP aan)
+
+VCC → 3V3 (belangrijk: geef deze module 3.3V, anders kan AO >3.3V worden en dat is niet veilig voor de ESP32-ADC)
+
+GND → GND
+
+(Nu nog niet aangesloten, maar in code gedefinieerd)
+
+Servo signaal → GPIO 13 (SERVO_PIN 13).
+Laat de servo voorlopig niet aangesloten; de code initialiseert ’m wel maar dat geeft geen probleem als er niks op pin 13 zit.
+
+Hall sensor → nog niet aangesloten; er staat niks voor in deze file (je testte die apart).
+
+Kleine checks
+
+Je platformio.ini moet overeenkomen met de TFT-pins hierboven (met CS=25, DC=27, RST=33, SPI-pinnen 23/19/18).
+
+In jouw code staat bij RAIN_D0 een comment “// <- change to 14 if wired there”. Gebruik je echt GPIO 26, dan hoef je niks te veranderen. Als je hem fysiek op GPIO 14 zet, pas dan de define aan.
+
+Voeding: ESP32 via USB; TFT op 5V, BME280 & regenmodule op 3V3; alle GND samen.
+
+Wat je nu zou moeten zien
+
+Display start met UI (“Rain & BME280”), nat/ droog chip, natte-balk en kaartjes.
+
+In Serial Monitor zie je een regel met calibratie en “BME=OK/NOT FOUND”.
+
+De servo beweegt niet (geen servo aangesloten); dat is prima.
+
+Als dit zo is aangesloten en je ziet nog iets geks (wit scherm, geen tekst), laat me weten wat er in de Serial Monitor staat en we debuggen gericht verder.
+
+HALL
+- links ground
+- midden 5V
+- rechts output/signal 32
+#include <Arduino.h>
+
+#define HALL_PIN 32
+void setup()
+{
+  Serial.begin(115200);
+  pinMode(HALL_PIN, INPUT_PULLUP); // module op 3.3V werkt zo prima
+}
+void loop()
+{
+  Serial.println(digitalRead(HALL_PIN)); // 1 = geen magneet, 0 = magneet dichtbij
+  delay(200);
+}
+
+//code 
+#include <Arduino.h>
+#include <Wire.h>
+#include <TFT_eSPI.h>        // TFT_eSPI configured via build_flags
+#include <Adafruit_BME280.h> // BME280
+#include <ESP32Servo.h>      // ESP32 servo
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+
+// === Pins ===
+#define RAIN_A0 34 // Analog from rain module (ADC1)
+#define RAIN_D0 26 // Digital output (potentiometer threshold)  // <- change to 14 if wired there
+#define I2C_SDA 21
+#define I2C_SCL 22
+#define SERVO_PIN 13 // SG90 signal
+
+// --- Wind / Hall anemometer ---
+#define HALL_PIN 32           // Hall OUT pin
+#define PPR 1                 // Pulses per revolution (1 magnet = 1)
+#define MIN_PULSE_US 20000    // Debounce: ignore pulses <10ms apart
+#define WIND_TIMEOUT_MS 10000 // If no pulse for this long -> wind=0
+#define RADIUS_M 0.06f        // Cup radius (meters) from axis to magnet/cup center
+#define K_FACTOR 1.10f        // Calibration factor (tune after testing)
+
+// === Display & Sensors ===
+TFT_eSPI tft;
+Adafruit_BME280 bme;
+bool bmeOk = false;
+
+// === Servo ===
+Servo servo;
+
+// =================== TUNABLES (rain logic) ===================
+#define LOGIC_PERIOD_MS 80
+#define AVG_SAMPLES 4
+#define WET_MARGIN 80
+#define TRIGGER_DROP 90
+#define DRY_HYST 80
+#define MIN_DENOM 80
+#define PCT_EASE_WET 0.65f
+#define PCT_EASE_DRY 0.25f
+// =============================================================
+
+// wifi and mqtt
+const char WIFI_SSID[] = "xxx";
+const char WIFI_PASS[] = "xxx";
+const char MQTT_BROKER_ADDRESS[] = "145.24.237.211:8883";
+const char MQTT_CLIENT_ID[] = "weather_station_01";
+const char MQTT_USER[] = "minor_smart_things";
+const char MQTT_PASS[] = "smart_things_2025";
+
+// mqtt topics
+const char GPS_TOPIC[] = "homestations/1053258/1/gps";
+const char WIND_TOPIC[] = "homestations/1053258/1/windspeed";
+const char RAIN_TOPIC[] = "homestations/1053258/1/rain";
+const char TEMP_TOPIC[] = "homestations/1053258/1/temperature";
+const char HUM_TOPIC[] = "homestations/1053258/1/humidity";
+const char PRESSURE_TOPIC[] = "homestations/1053258/1/airpressure";
+const char MOTOR_TOPIC[] = "homestations/1053258/1/motor";
+
+const int PUBLISH_INTERVAL = 10000; // publish every 10 seconds
+
+WiFiClient network;
+PubSubClient mqtt(network);
+
+unsigned long lastPublishTime = 0;
+
+// === Servo stability (debounce + dwell) ===
+const uint32_t SERVO_MIN_ON_MS = 10000; // stay at 90° at least 10s once wet
+const uint32_t SERVO_MIN_OFF_MS = 5000; // stay at 0° at least 5s once dry
+const uint32_t WET_DEBOUNCE_MS = 800;   // ~0.8s continuous wet before switching on
+const uint32_t DRY_DEBOUNCE_MS = 1200;  // ~1.2s continuous dry before switching off
+uint32_t wetSeenSince = 0;
+uint32_t drySeenSince = 0;
+uint32_t servoLastChange = 0;
+bool servoAtWet = false; // true => 90°, false => 0°
+
+/* === Theme === */
+static const uint16_t COL_BG = TFT_BLACK;
+static const uint16_t COL_SURFACE = 0x0841; // dark grey-blue
+static const uint16_t COL_BORDER = TFT_DARKGREY;
+static const uint16_t COL_ACCENT = 0x027F; // cyan-ish
+static const uint16_t COL_GOOD = TFT_GREEN;
+static const uint16_t COL_BAD = TFT_RED;
+static const uint16_t COL_TEXT = TFT_WHITE;
+static const uint16_t COL_MUTE = TFT_LIGHTGREY;
+static const uint16_t COL_NUMBER = 0x06BF; // bright cyan
+
+// === Helpers ===
+static uint16_t avgRead(int pin, int n = AVG_SAMPLES)
+{
+  uint32_t s = 0;
+  for (int i = 0; i < n; i++)
+  {
+    s += analogRead(pin);
+    delay(2);
+  }
+  return s / n;
+}
+
+// --- Auto-cal references ---
+static uint16_t dryRef = 3500; // learned at boot
+static uint16_t wetRef = 1500; // tracks “wettest recent”
+
+// Digital polarity: true if digital pin reads LOW when wet (common)
+static bool digitalWetIsLow = true;
+
+// --- Layout (adaptive) ---
+bool compactMode = false; // true for height ~240
+int PAD, APPBAR_H, CHIP_H, PILL_H, CARD_H;
+int GAP_S, GAP_M, GAP_ROW;
+
+int PILL_X, PILL_Y, PILL_W;
+int CARD_W, CARD_ROW1_Y, CARD_ROW2_Y;
+
+// --- State / animation ---
+float dispPct = 0.0f;
+uint32_t lastUi = 0, lastLogic = 0, lastChangeMs = 0;
+bool stateWet = false;
+int lastPillFill = -1;
+
+// ===== Wind ISR/shared =====
+volatile uint32_t wind_last_us = 0;
+volatile int pulses = 0;
+
+void IRAM_ATTR onHall()
+{
+  uint32_t now = micros();
+  uint32_t dt = now - wind_last_us;
+  if (dt >= MIN_PULSE_US)
+  { // debounce
+    wind_last_us = now;
+    pulses++;
+  }
+}
+
+struct WindSample
+{
+  float rpm;
+  float ms;
+};
+
+WindSample readWind()
+{
+  static WindSample s{0, 0};
+  static uint32_t lastMs = millis();
+
+  // timeout => wind = 0
+  if (millis() - lastMs > WIND_TIMEOUT_MS)
+  {
+    s.rpm = pulses * 60.0f / PPR / (WIND_TIMEOUT_MS / 1000.0f);
+    pulses = 0;
+    lastMs = millis();
+    s.ms = 0.0063 * s.rpm + 1.9973;
+  }
+  return s;
+}
+
+// ================== UI primitives ==================
+void drawShadowRect(int x, int y, int w, int h, uint16_t fill, uint16_t shadow = 0x0841)
+{
+  tft.fillRoundRect(x + 1, y + 2, w, h, 10, shadow);
+  tft.fillRoundRect(x, y, w, h, 10, fill);
+}
+
+void drawChip(bool isDry)
+{
+  const char *label = isDry ? "DRY" : "RAIN";
+  uint16_t col = isDry ? COL_GOOD : COL_BAD;
+
+  int cx = tft.width() / 2, w = compactMode ? 120 : 136, h = CHIP_H;
+  int x = cx - w / 2, y = PAD + APPBAR_H + GAP_S;
+
+  // chip background
+  tft.fillRoundRect(x, y, w, h, 16, COL_SURFACE);
+  tft.drawRoundRect(x, y, w, h, 16, col);
+
+  // simple icon
+  if (isDry)
+  {
+    tft.fillCircle(x + 18, y + h / 2, compactMode ? 7 : 8, COL_GOOD);
+  }
+  else
+  {
+    int cx2 = x + 18, cy2 = y + h / 2;
+    tft.fillCircle(cx2, cy2 - 4, compactMode ? 5 : 6, COL_BAD);
+    tft.fillTriangle(cx2 - 6, cy2 - 2, cx2 + 6, cy2 - 2, cx2, cy2 + 10, COL_BAD);
+  }
+
+  // text
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(col, COL_SURFACE);
+  tft.setTextFont(1);
+  tft.setTextSize(compactMode ? 2 : 3);
+  tft.drawString(label, cx + 4, y + h / 2);
+  tft.setTextSize(1);
+  tft.setTextDatum(TL_DATUM);
+}
+
+void drawAppBar()
+{
+  drawShadowRect(PAD, PAD, tft.width() - 2 * PAD, APPBAR_H, COL_SURFACE);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextFont(compactMode ? 1 : 2);
+  tft.setTextColor(COL_MUTE, COL_SURFACE);
+  tft.drawString("Rain · Wind · BME280", PAD + 8, PAD + (compactMode ? 4 : 6));
+}
+
+void drawPillFrame()
+{
+  // label
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextFont(compactMode ? 1 : 2);
+  tft.setTextColor(COL_TEXT, COL_BG);
+  tft.drawString("Wetness", PILL_X, PILL_Y - (compactMode ? 14 : 18));
+
+  // pill outline
+  tft.fillRoundRect(PILL_X, PILL_Y, PILL_W, PILL_H, PILL_H / 2, COL_SURFACE);
+  tft.drawRoundRect(PILL_X, PILL_Y, PILL_W, PILL_H, PILL_H / 2, COL_BORDER);
+
+  // ticks
+  for (int i = 0; i <= 10; i++)
+  {
+    int x = PILL_X + (PILL_W * i) / 10;
+    tft.drawLine(x, PILL_Y + PILL_H + 1, x, PILL_Y + PILL_H + (compactMode ? 4 : 6), COL_BORDER);
+  }
+  tft.setTextColor(COL_MUTE, COL_BG);
+  tft.drawString("0%", PILL_X, PILL_Y + PILL_H + (compactMode ? 6 : 8));
+  tft.setTextDatum(TR_DATUM);
+  tft.drawString("100%", PILL_X + PILL_W, PILL_Y + PILL_H + (compactMode ? 6 : 8));
+  tft.setTextDatum(TL_DATUM);
+}
+
+void drawPillFill(float pct)
+{
+  pct = constrain(pct, 0.0f, 100.0f);
+  int fillW = (int)(PILL_W * (pct / 100.0f));
+  if (fillW == lastPillFill)
+    return;
+  lastPillFill = fillW;
+
+  // erase area
+  tft.fillRoundRect(PILL_X + 1, PILL_Y + 1, PILL_W - 2, PILL_H - 2, (PILL_H - 2) / 2, COL_SURFACE);
+  // fill
+  if (fillW > 2)
+  {
+    tft.fillRoundRect(PILL_X + 1, PILL_Y + 1, fillW - 2, PILL_H - 2, (PILL_H - 2) / 2, COL_ACCENT);
+  }
+
+  // big % number at right
+  int px = PILL_X + PILL_W - 4, py = PILL_Y - (compactMode ? 0 : 2);
+  tft.fillRect(px - (compactMode ? 66 : 86), py - (compactMode ? 18 : 22),
+               (compactMode ? 66 : 86), (compactMode ? 18 : 22), COL_BG);
+  tft.setTextDatum(TR_DATUM);
+  tft.setTextFont(compactMode ? 1 : 2);
+  tft.setTextColor(COL_NUMBER, COL_BG);
+  tft.drawString(compactMode ? String(pct, 0) + " %" : String(pct, 1) + " %", px, py);
+  tft.setTextDatum(TL_DATUM);
+}
+
+// ===== Cards =====
+// New layout:
+// Row1:  [Wind]
+// Row2:  [Temp/Hum]   [Pressure]
+void drawCardsFrame()
+{
+  // Row 1: Wind (single wide card)
+  drawShadowRect(PAD, CARD_ROW1_Y, (tft.width() - 2 * PAD), CARD_H, COL_SURFACE);
+
+  // Row 2: Temp/Hum + Pressure
+  CARD_W = (tft.width() - 3 * PAD) / 2;
+  drawShadowRect(PAD, CARD_ROW2_Y, CARD_W, CARD_H, COL_SURFACE);
+  drawShadowRect(PAD * 2 + CARD_W, CARD_ROW2_Y, CARD_W, CARD_H, COL_SURFACE);
+
+  // Labels
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextFont(compactMode ? 1 : 2);
+  tft.setTextColor(COL_MUTE, COL_SURFACE);
+  // Row1
+  tft.drawString("Wind", PAD + 10, CARD_ROW1_Y + (compactMode ? 4 : 6));
+  // Row2
+  tft.drawString("Temp / Hum", PAD + 10, CARD_ROW2_Y + (compactMode ? 4 : 6));
+  tft.drawString("Pressure", PAD * 2 + CARD_W + 10, CARD_ROW2_Y + (compactMode ? 4 : 6));
+
+  if (!compactMode || tft.height() >= 230)
+  {
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextFont(compactMode ? 1 : 2);
+    tft.setTextColor(COL_TEXT, COL_BG);
+    tft.drawString("Reset with plate dry to re-calibrate",
+                   tft.width() / 2, tft.height() - (compactMode ? 8 : 10));
+  }
+}
+
+void updateWindSpeedCard(float ms)
+{
+
+  // full width row1 card value
+  int y = CARD_ROW1_Y;
+  int valueY = y + (compactMode ? 22 : 26);
+  int valueW = (tft.width() - 2 * PAD) - 20;
+  tft.fillRect(PAD + 10, valueY, valueW, (compactMode ? 20 : 24), COL_SURFACE);
+
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextFont(1);
+  tft.setTextSize(2);
+  tft.setTextColor(COL_NUMBER, COL_SURFACE);
+  char buf[24];
+  snprintf(buf, sizeof(buf), "%.1f m/s", ms);
+  tft.drawString(buf, PAD + 10, valueY);
+  tft.setTextSize(1);
+}
+
+void updateEnvTempHum(float tC, float rh)
+{
+  int y = CARD_ROW2_Y;
+  tft.fillRect(PAD + 10, y + (compactMode ? 22 : 26), CARD_W - 20,
+               (compactMode ? 20 : 24), COL_SURFACE);
+
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextFont(1);
+  tft.setTextSize(2);
+  tft.setTextColor(COL_NUMBER, COL_SURFACE);
+  if (bmeOk)
+  {
+    char buf[48];
+    if (compactMode)
+      snprintf(buf, sizeof(buf), "%.1fC  %.0f%%", tC, rh);
+    else
+      snprintf(buf, sizeof(buf), "%.1f°C   %.0f%%", tC, rh);
+    tft.drawString(buf, PAD + 10, y + (compactMode ? 22 : 26));
+  }
+  else
+  {
+    tft.drawString("-- C  -- %", PAD + 10, y + (compactMode ? 22 : 26));
+  }
+  tft.setTextSize(1);
+}
+
+void updateEnvPressure(float hPa)
+{
+  int y = CARD_ROW2_Y;
+  int x = PAD * 2 + CARD_W;
+
+  tft.fillRect(x + 10, y + (compactMode ? 22 : 26), CARD_W - 20,
+               (compactMode ? 20 : 24), COL_SURFACE);
+
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextFont(1);
+  tft.setTextSize(2);
+  tft.setTextColor(COL_NUMBER, COL_SURFACE);
+  if (bmeOk)
+  {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%.0f hPa", hPa);
+    tft.drawString(buf, x + 10, y + (compactMode ? 22 : 26));
+  }
+  else
+  {
+    tft.drawString("-- hPa", x + 10, y + (compactMode ? 22 : 26));
+  }
+  tft.setTextSize(1);
+}
+
+// tiny heartbeat in app bar
+void heartbeat()
+{
+  static bool on = false;
+  on = !on;
+  tft.fillCircle(tft.width() - 12, PAD + (compactMode ? 12 : 16),
+                 (compactMode ? 3 : 4), on ? COL_ACCENT : COL_BORDER);
+}
+
+// --------- Layout compute (adaptive to height) ---------
+void configureLayout()
+{
+  compactMode = (tft.height() < 300); // true for typical 240-tall screens
+
+  if (compactMode)
+  {
+    PAD = 6;
+    APPBAR_H = 30;
+    CHIP_H = 28;
+    PILL_H = 18;
+    CARD_H = 44;
+    GAP_S = 4;
+    GAP_M = 8;
+    GAP_ROW = 6;
+  }
+  else
+  {
+    PAD = 12;
+    APPBAR_H = 44;
+    CHIP_H = 36;
+    PILL_H = 26;
+    CARD_H = 58;
+    GAP_S = 6;
+    GAP_M = 12;
+    GAP_ROW = 14;
+  }
+
+  PILL_X = PAD;
+  PILL_W = tft.width() - 2 * PAD;
+  PILL_Y = PAD + APPBAR_H + GAP_S + CHIP_H + GAP_M;
+
+  // Cards
+  CARD_ROW1_Y = PILL_Y + PILL_H + (compactMode ? 16 : 30); // Wind (full width)
+  CARD_ROW2_Y = CARD_ROW1_Y + CARD_H + GAP_ROW;            // Temp/Hum + Pressure
+}
+
+// ================== Setup / Loop ==================
+void setup()
+{
+  Serial.begin(115200);
+  delay(140);
+
+  tft.init();
+  tft.setRotation(1); // landscape
+  tft.fillScreen(COL_BG);
+
+  configureLayout();
+
+  // UI frame
+  drawAppBar();
+  drawChip(true); // placeholder; will refresh after first read
+  drawPillFrame();
+  drawCardsFrame();
+
+  // ADC for rain
+  analogSetWidth(12);
+  analogSetPinAttenuation(RAIN_A0, ADC_11db);
+  pinMode(RAIN_D0, INPUT_PULLUP); // avoid floating
+
+  // Auto-cal DRY at boot (keep plate dry ~0.4–0.5s)
+  uint32_t sum = 0;
+  for (int i = 0; i < 30; i++)
+  {
+    sum += analogRead(RAIN_A0);
+    delay(8);
+  }
+  dryRef = sum / 30;
+  if (dryRef >= 4000)
+  {
+    Serial.println("WARN: ADC saturated at boot; using fallback dryRef=3500.");
+    dryRef = 3500;
+  }
+  wetRef = (dryRef > WET_MARGIN) ? dryRef - WET_MARGIN : (dryRef > 20 ? dryRef - 20 : dryRef);
+
+  lastChangeMs = millis();
+
+  // Simple digital polarity auto-detect (optional safety)
+  uint32_t s2 = 0;
+  for (int i = 0; i < 12; i++)
+  {
+    s2 += analogRead(RAIN_A0);
+    delay(4);
+  }
+  uint16_t rawavg = s2 / 12;
+  int d0sample = digitalRead(RAIN_D0);
+  if (rawavg < 4000 && abs((int)rawavg - (int)dryRef) < 150)
+  {
+    digitalWetIsLow = !(d0sample == 0);
+  }
+  else
+  {
+    digitalWetIsLow = true; // assume LOW==wet (typical)
+  }
+
+  stateWet = digitalWetIsLow ? (digitalRead(RAIN_D0) == 0) : (digitalRead(RAIN_D0) == 1);
+  drawChip(!stateWet);
+
+  // I2C + BME280 init (try 0x76 then 0x77)
+  Wire.begin(I2C_SDA, I2C_SCL);
+  bmeOk = bme.begin(0x76, &Wire);
+  if (!bmeOk)
+    bmeOk = bme.begin(0x77, &Wire);
+
+  // Servo init
+  servo.setPeriodHertz(50);           // standard analog servo frequency
+  servo.attach(SERVO_PIN, 500, 2400); // min/max pulse (us) for SG90
+  servo.write(0);
+  servoAtWet = false;
+  servoLastChange = millis();
+
+  // Hall / wind
+  pinMode(HALL_PIN, INPUT); // most modules have on-board pull-up
+  attachInterrupt(digitalPinToInterrupt(HALL_PIN), onHall, FALLING);
+
+  Serial.printf("Boot calib: dryRef=%u, wetRef(start)=%u, BME=%s, H=%d\n",
+                dryRef, wetRef, bmeOk ? "OK" : "NOT FOUND", tft.height());
+}
+
+void loop()
+{
+  // Logic tick
+  if (millis() - lastLogic >= LOGIC_PERIOD_MS)
+  {
+    lastLogic = millis();
+
+    // ---- Rain logic ----
+    uint16_t raw = avgRead(RAIN_A0);
+    int d0 = digitalRead(RAIN_D0);
+    bool hwWet = digitalWetIsLow ? (d0 == 0) : (d0 == 1);
+
+    bool dropWet = (raw + TRIGGER_DROP < dryRef);
+    bool wetNow = hwWet || dropWet;
+
+    if (wetNow)
+    {
+      if (raw < wetRef)
+        wetRef = raw;
+    }
+    else
+    {
+      wetRef = (uint16_t)(wetRef + (dryRef - wetRef) / 300);
+    }
+
+    if (!wetNow && raw > (uint16_t)(dryRef - DRY_HYST) && raw > dryRef)
+    {
+      dryRef = (uint16_t)((199 * dryRef + raw) / 200);
+    }
+
+    int denom = (int)dryRef - (int)wetRef;
+    if (denom < MIN_DENOM)
+      denom = MIN_DENOM;
+    float targetPct = 100.0f * (float)(dryRef - raw) / (float)denom;
+    targetPct = constrain(targetPct, 0.0f, 100.0f);
+
+    float ease = wetNow ? PCT_EASE_WET : PCT_EASE_DRY;
+    dispPct += (targetPct - dispPct) * ease;
+
+    if (wetNow != stateWet)
+    {
+      stateWet = wetNow;
+      drawChip(!stateWet);
+      lastChangeMs = millis();
+    }
+
+    // === Stable servo control ===
+    uint32_t now = millis();
+    if (wetNow)
+    {
+      if (wetSeenSince == 0)
+        wetSeenSince = now;
+      drySeenSince = 0;
+    }
+    else
+    {
+      if (drySeenSince == 0)
+        drySeenSince = now;
+      wetSeenSince = 0;
+    }
+
+    bool requestWet = (wetSeenSince != 0) && (now - wetSeenSince >= WET_DEBOUNCE_MS);
+    bool requestDry = (drySeenSince != 0) && (now - drySeenSince >= DRY_DEBOUNCE_MS);
+    bool canLeaveWet = (now - servoLastChange >= SERVO_MIN_ON_MS);
+    bool canLeaveDry = (now - servoLastChange >= SERVO_MIN_OFF_MS);
+
+    if (!servoAtWet && requestWet && canLeaveDry)
+    {
+      servo.write(90); // go to 90° when wet
+      servoAtWet = true;
+      servoLastChange = now;
+      Serial.println("Servo -> 90 (WET)");
+    }
+    if (servoAtWet && requestDry && canLeaveWet)
+    {
+      servo.write(0); // back to 0° when dry
+      servoAtWet = false;
+      servoLastChange = now;
+      Serial.println("Servo -> 0 (DRY)");
+    }
+
+    // ---- Wind read ----
+    WindSample w = readWind();
+
+    // ---- BME280 reads ----
+    float tC = NAN, rh = NAN, hPa = NAN;
+    if (bmeOk)
+    {
+      tC = bme.readTemperature();        // °C
+      rh = bme.readHumidity();           // %
+      hPa = bme.readPressure() / 100.0f; // Pa -> hPa
+    }
+
+    // ---- UI updates ----
+    drawPillFill(dispPct);
+    updateWindSpeedCard(w.ms);
+    updateEnvTempHum(tC, rh);
+    updateEnvPressure(hPa);
+  }
+
+  // heartbeat
+  if (millis() - lastUi >= 400)
+  {
+    lastUi = millis();
+    heartbeat();
+  }
+}
